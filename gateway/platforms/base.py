@@ -1839,6 +1839,9 @@ def resolve_channel_skills(
     return None
 
 
+_UNSET_GENERATION: Any = object()  # no run-generation snapshot was taken for this turn
+
+
 def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
     generation."""
@@ -1954,6 +1957,10 @@ class BasePlatformAdapter(ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
+        # Generation-tagged callbacks live in their own lane per (session_key, generation): a queued
+        # follow-up registering under a newer generation must not overwrite the previous turn's
+        # callbacks (progress-bubble cleanup) while that turn is still unwinding.
+        self._post_delivery_callbacks_by_generation: dict[tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -3428,21 +3435,40 @@ class BasePlatformAdapter(ABC):
         self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
         """Register a deferred callback to fire after the main response. Same-key registrations are
         chained (both fire in order, per-callback exception isolation) so independent features
-        coexist; ``generation`` ties it to a gateway run — stale generations never overwrite a
-        fresher slot."""
+        coexist; ``generation`` ties it to a gateway run. Each generation owns its own lane, so a
+        queued follow-up (newer generation) can never overwrite the previous turn's unfired
+        callbacks, and a stale generation cannot open a lane once a fresher run owns the session."""
         if not session_key or not callable(callback):
             return
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            existing_gen, existing_cb = _split_post_delivery_entry(existing)
-            if existing_gen is not None and generation is not None and int(generation) < int(existing_gen):
-                return
-            # Same-or-newer generation: chain so both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None or generation is None or int(existing_gen) == int(generation)):
-                callback = self._chain_callbacks(existing_cb, callback)
-        self._post_delivery_callbacks[session_key] = (
-            callback if generation is None else (int(generation), callback))
+        if generation is None:
+            existing = self._post_delivery_callbacks.get(session_key)
+            if existing is not None:
+                _, existing_cb = _split_post_delivery_entry(existing)
+                if callable(existing_cb):
+                    callback = self._chain_callbacks(existing_cb, callback)
+            self._post_delivery_callbacks[session_key] = callback
+            return
+        generation = int(generation)
+        lanes = self._post_delivery_lanes()
+        lane_key = (session_key, generation)
+        existing_lane = lanes.get(lane_key)
+        if existing_lane is not None:
+            lanes[lane_key] = self._chain_callbacks(existing_lane, callback)
+            return
+        if any(key == session_key and gen > generation for key, gen in lanes):
+            return  # stale run: a fresher run already owns this session
+        legacy = self._post_delivery_callbacks.get(session_key)
+        if legacy is not None:
+            legacy_gen, legacy_cb = _split_post_delivery_entry(legacy)
+            if legacy_gen is None and callable(legacy_cb):
+                # A bare callback registered earlier joins this run's lane (previous chaining behaviour).
+                self._post_delivery_callbacks.pop(session_key, None)
+                callback = self._chain_callbacks(legacy_cb, callback)
+        lanes[lane_key] = callback
+        # Bound the lanes of one session: lanes whose run never reached its finally are dropped oldest first.
+        owned = sorted(gen for key, gen in lanes if key == session_key)
+        for stale_gen in owned[:-16]:
+            lanes.pop((session_key, stale_gen), None)
 
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
@@ -3458,16 +3484,39 @@ class BasePlatformAdapter(ABC):
                     logger.debug("Post-delivery callback failed", exc_info=True)
         return _chained
 
+    def _post_delivery_lanes(self) -> dict[tuple[str, int], Callable]:
+        """Per-generation callback lanes (created lazily for adapters built without ``__init__``)."""
+        return _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+
+    def _pop_all_post_delivery_lanes(self, session_key: str) -> Callable | None:
+        """Pop every generation lane of ``session_key`` (oldest first) as one callable, or ``None``."""
+        lanes = self._post_delivery_lanes()
+        keys = sorted((key for key in lanes if key[0] == session_key), key=lambda key: key[1])
+        callbacks = [cb for cb in (lanes.pop(key, None) for key in keys) if callable(cb)]
+        if not callbacks:
+            return None
+        return callbacks[0] if len(callbacks) == 1 else self._chain_callbacks(*callbacks)
+
     def pop_post_delivery_callback(
         self, session_key: str, *, generation: int | None = None) -> Callable | None:
         """Pop a deferred callback, optionally requiring generation ownership."""
-        entry = self._post_delivery_callbacks.get(session_key) if session_key else None
-        if entry is None:
+        if not session_key:
             return None
+        if generation is not None:
+            lane_cb = self._post_delivery_lanes().pop((session_key, int(generation)), None)
+            if lane_cb is not None:
+                return lane_cb if callable(lane_cb) else None
+        entry = self._post_delivery_callbacks.get(session_key)
+        if entry is None:
+            return self._pop_all_post_delivery_lanes(session_key) if generation is None else None
         entry_generation, callback = _split_post_delivery_entry(entry)
         if generation is not None and (entry_generation is None or int(entry_generation) != int(generation)):
             return None
         self._post_delivery_callbacks.pop(session_key, None)
+        if generation is None:
+            lanes_cb = self._pop_all_post_delivery_lanes(session_key)
+            if lanes_cb is not None:
+                callback = self._chain_callbacks(callback, lanes_cb) if callable(callback) else lanes_cb
         return callback if callable(callback) else None
 
     # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
@@ -4492,12 +4541,18 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+    async def _fire_post_delivery_callback(
+        self, session_key: str, interrupt_event: asyncio.Event, *, generation: Any = _UNSET_GENERATION,
+    ) -> None:
+        """Run the one-shot post-delivery callback (bounded, errors swallowed). ``generation`` is the
+        run generation captured right after THIS turn's handler returned. The interrupt event is shared
+        with the drain task of a queued follow-up, which re-stamps its own generation on it while this
+        task is still unwinding, so a late read from the event would pop the wrong lane. Without a
+        snapshot (handler raised) the event is read here: it is stamped DURING the handler await, so an
+        earlier snapshot would let stale runs fire a fresher run's callbacks."""
+        if generation is _UNSET_GENERATION:
+            generation = getattr(interrupt_event, "_hermes_run_generation", None)
+        _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
         if callable(_post_cb):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
@@ -4542,10 +4597,14 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        delivery_generation: Any = _UNSET_GENERATION
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            # Snapshot now: a queued follow-up reuses this event and re-stamps its own generation on it
+            # before this task reaches its finally block.
+            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4645,7 +4704,7 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            await self._fire_post_delivery_callback(session_key, interrupt_event, generation=delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
