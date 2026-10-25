@@ -738,6 +738,10 @@ class GatewayTurnPrepareMixin:
         # Bind this run generation to the adapter so deferred post-delivery callbacks are released
         # by the run that registered them.
         self._bind_adapter_run_generation(self._delivery_adapter_for(source), session_key, run_generation)
+        # The adapter's active-session Event is shared by chained turns, so a lifecycle that delivers a
+        # queued turn's reply (``dispatch_shared_busy``) reads the generation off the event it ran instead.
+        with suppress(Exception):
+            event._hermes_run_generation = int(run_generation)
         # Delivery IDs are only unique in their transport namespace. Keyless turns
         # need their own identity, even when another process writes to this session.
         import uuid

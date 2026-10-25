@@ -418,6 +418,9 @@ async def deliver_response(adapter, event, session_key, response):
                                        record_delivery=results.append)
 
 
+_UNSTAMPED = object()  # the turn never returned from its handler: nothing to fire
+
+
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
     """Serial receive loops (IRC, Signal) await this before reading their next frame, so return
     once the follow-up is committed to the FIFO, or queued behind an earlier input of its chat still
@@ -436,8 +439,13 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
         # Like the first message's lifecycle, this sender adopts the turn's crash marker and
         # releases it only once the reply is ledgered (the marker moves onto ``event``).
         event._turn_marker_handoff = getattr(adapter, 'gateway_runner', None) is not None
+        generation = _UNSTAMPED
         try:
             response = await adapter._message_handler(event)
+            # The turn stamps its run generation on the event it ran (``_hmwa_prepare_turn``); read it
+            # before delivery so the callbacks this turn registered (progress-bubble cleanup, bg-review
+            # release) are the ones fired, never a concurrent turn's.
+            generation = getattr(event, '_hermes_run_generation', None)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
@@ -448,6 +456,12 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             logger.error('[%s] Queued busy follow-up failed: %s', adapter.name, exc, exc_info=True)
             await adapter._notify_turn_error(delivery_event, exc)
         finally:
+            # This lifecycle replaces ``_process_message_background`` for a busy follow-up, so it owes the
+            # same one-shot post-delivery callbacks: without them the follow-up's tool-progress bubbles
+            # (display.cleanup_progress) were never deleted. Bounded and exception-isolated.
+            fire = getattr(adapter, '_fire_post_delivery_callback', None)
+            if generation is not _UNSTAMPED and callable(fire):  # duck-typed test adapters may lack it
+                await fire(session_key, None, generation=generation)
             # Clears the marker if no ledgered send did, then wakes the drain's bounded wait,
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
